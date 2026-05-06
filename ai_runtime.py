@@ -35,6 +35,7 @@ RATE_LIMIT_PATTERNS = [
     "rate limit",
     "claude pro usage limit",
     "you've reached your",
+    "you've hit your limit",
     "too many requests",
     "quota exceeded",
 ]
@@ -267,7 +268,9 @@ def extract_last_step(output_lines):
 
     if cleaned:
         last_block = " ".join(cleaned[-5:])
-        sentences = re.findall(r'[A-Z][^.!?]{10,}[.!?]', last_block)
+        # Split on sentence-ending punctuation NOT followed by a file extension
+        # e.g. "Fixed auth.ts." ends sentence; "auth.ts is done" does not
+        sentences = re.findall(r'[A-Z][^!?]*?(?:\.[a-z]{2,4})*[.!?](?=\s|$)', last_block)
         if sentences:
             return sentences[-1][:300]
         return last_block[:300]
