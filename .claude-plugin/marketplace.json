@@ -1,0 +1,52 @@
+{
+  "name": "ai-runtime",
+  "displayName": "AI Runtime",
+  "description": "Claude CLI checkpoint and auto-recovery. Automatically saves task state and resumes with full context when Claude hits a rate limit, crashes, or your terminal closes. No more restarting from scratch.",
+  "version": "0.1.0",
+  "author": {
+    "name": "Kunal Rawat",
+    "url": "https://github.com/kunalrawat425"
+  },
+  "license": "MIT",
+  "homepage": "https://github.com/kunalrawat425/ai-runtime",
+  "repository": {
+    "type": "git",
+    "url": "https://github.com/kunalrawat425/ai-runtime.git"
+  },
+  "keywords": [
+    "claude-code",
+    "claude-skill",
+    "recovery",
+    "checkpoint",
+    "rate-limit",
+    "auto-resume",
+    "ai-agent",
+    "productivity",
+    "cli"
+  ],
+  "skills": [
+    {
+      "name": "ai-runtime",
+      "path": "skills/ai-runtime",
+      "primary": true
+    }
+  ],
+  "requirements": {
+    "claudeCode": ">=1.0.33",
+    "python": ">=3.8"
+  },
+  "install": {
+    "script": "install.sh",
+    "scriptWindows": "install.ps1"
+  },
+  "screenshots": [
+    {
+      "path": "screenshots/cover-image.png",
+      "alt": "AI Runtime — Claude CLI auto-recovery"
+    },
+    {
+      "path": "screenshots/demo.gif",
+      "alt": "Demo: rate limit hit and auto-resume"
+    }
+  ]
+}

@@ -1,3 +1,5 @@
+![AI Runtime](screenshots/cover-image.png)
+
 # ai-runtime
 
 **Automatic checkpoint and recovery for Claude CLI.** When Claude hits a rate limit, crashes, or your terminal closes — ai-runtime saves exactly where it was and resumes automatically with full context.
@@ -22,10 +24,24 @@ Claude hits your usage limit mid-task. You run `claude --continue`. Claude start
 
 ## Install
 
+### Claude Code Marketplace (recommended)
+
+```
+/plugin install kunalrawat425/ai-runtime
+```
+
+Or search in the marketplace:
+```
+/plugin marketplace search ai-runtime
+```
+
+### Manual (git clone)
+
 ```bash
 git clone https://github.com/kunalrawat425/ai-runtime.git
 cd ai-runtime
-bash install.sh
+bash install.sh          # macOS / Linux
+# install.ps1            # Windows (PowerShell)
 ```
 
 One-liner:
