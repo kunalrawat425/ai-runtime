@@ -1,0 +1,1 @@
+/Users/kunalrawat/conductor/repos/aosur/.claude/skills/gstack/pair-agent/SKILL.md
