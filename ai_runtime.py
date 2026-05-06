@@ -22,7 +22,8 @@ import select
 import fcntl
 import threading
 from pathlib import Path
-from datetime import datetime
+from datetime import datetime, date
+import zoneinfo
 
 # ── Config ────────────────────────────────────────────────────────────────────
 
@@ -39,6 +40,68 @@ RATE_LIMIT_PATTERNS = [
 ]
 
 DEFAULT_WAIT_SECONDS = int(os.environ.get("AI_RUNTIME_WAIT_SECONDS", "3600"))
+MAX_ATTEMPTS = int(os.environ.get("AI_RUNTIME_MAX_ATTEMPTS", "10"))
+IS_WINDOWS = sys.platform == "win32"
+
+# ── Reset time parsing ────────────────────────────────────────────────────────
+
+# Matches: "resets 10pm (America/New_York)" or "resets 10:30pm (UTC)"
+_RESET_RE = re.compile(
+    r'resets\s+(\d{1,2})(?::(\d{2}))?\s*(am|pm)\s*\(([^)]+)\)',
+    re.IGNORECASE,
+)
+
+def parse_reset_time(line: str):
+    """
+    Extract reset time from Claude's rate limit message.
+    Returns seconds to wait, or None if not parseable.
+
+    Claude outputs: "You've hit your limit · resets 10pm (America/New_York)"
+    """
+    m = _RESET_RE.search(line)
+    if not m:
+        return None
+
+    hour_str, minute_str, ampm, tz_name = m.groups()
+    hour = int(hour_str)
+    minute = int(minute_str) if minute_str else 0
+    ampm = ampm.lower()
+
+    if ampm == "pm" and hour != 12:
+        hour += 12
+    elif ampm == "am" and hour == 12:
+        hour = 0
+
+    try:
+        tz = zoneinfo.ZoneInfo(tz_name)
+    except (zoneinfo.ZoneInfoNotFoundError, KeyError):
+        return None
+
+    now = datetime.now(tz)
+    reset = now.replace(hour=hour, minute=minute, second=0, microsecond=0)
+
+    if reset <= now:
+        # Reset time already passed today — must be tomorrow
+        from datetime import timedelta
+        reset += timedelta(days=1)
+
+    wait = (reset - now).total_seconds()
+    # Add 90s buffer — Anthropic sometimes resets slightly late
+    return max(0, wait + 90)
+
+
+def compute_wait(output_lines: list, fallback: int = DEFAULT_WAIT_SECONDS) -> tuple:
+    """
+    Return (seconds_to_wait, reset_time_str).
+    Tries to parse reset time from recent output. Falls back to fixed wait.
+    """
+    for line in reversed(output_lines[-20:]):
+        secs = parse_reset_time(line)
+        if secs is not None:
+            reset_dt = datetime.now().timestamp() + secs
+            reset_str = datetime.fromtimestamp(reset_dt).strftime("%H:%M:%S")
+            return secs, f"reset at {reset_str} (parsed from Claude)"
+    return fallback, f"{fallback//60}m (fallback — reset time not found in output)"
 
 # ── Session ───────────────────────────────────────────────────────────────────
 
@@ -96,18 +159,37 @@ class Session:
 # ── Claude session file discovery ─────────────────────────────────────────────
 
 def find_claude_session_file(cwd):
-    """Find the most recent Claude conversation JSONL for this project dir."""
-    slug = str(cwd).replace("/", "-")
-    project_dir = CLAUDE_PROJECTS_DIR / slug
-    if not project_dir.exists():
-        return None
-    jsonl_files = [
-        f for f in project_dir.glob("*.jsonl")
-        if f.is_file() and not f.parent != project_dir  # exclude subagent files
+    """
+    Find the most recent Claude conversation JSONL for this project dir.
+    Strategy:
+    1. Exact slug match for cwd
+    2. Walk up parent dirs (handles cwd-changed case)
+    3. Fall back to most recently modified JSONL across ALL projects (last 30 min)
+    """
+    cwd = Path(cwd)
+
+    # Try exact cwd and parents (up to 3 levels)
+    for directory in [cwd] + list(cwd.parents)[:3]:
+        slug = str(directory).replace("/", "-")
+        project_dir = CLAUDE_PROJECTS_DIR / slug
+        if project_dir.exists():
+            files = [
+                f for f in project_dir.glob("*.jsonl")
+                if f.is_file() and f.parent == project_dir
+            ]
+            if files:
+                return max(files, key=lambda f: f.stat().st_mtime)
+
+    # Fallback: most recently touched JSONL across all projects, within 30 min
+    cutoff = time.time() - 1800
+    candidates = [
+        f for f in CLAUDE_PROJECTS_DIR.glob("*/*.jsonl")
+        if f.is_file() and f.stat().st_mtime > cutoff
     ]
-    if not jsonl_files:
-        return None
-    return max(jsonl_files, key=lambda f: f.stat().st_mtime)
+    if candidates:
+        return max(candidates, key=lambda f: f.stat().st_mtime)
+
+    return None
 
 def inject_context(session_file, checkpoint):
     """
@@ -130,12 +212,18 @@ def inject_context(session_file, checkpoint):
             "role": "user",
             "content": (
                 f"[AI-RUNTIME CONTEXT RESTORED — interrupted by: {interrupted_by}]\n\n"
-                f"You were working on: {task}\n\n"
+                "⚠️ SESSION RESUMED BY AI-RUNTIME — DO NOT START OVER ⚠️\n\n"
+                f"Task: {task}\n\n"
                 f"Last completed step: {last_step}\n\n"
-                f"Files you had modified: {files_str}\n\n"
-                "Please resume from where you stopped. Continue the task without "
-                "restarting or re-explaining what was already done. If you're not "
-                "sure where you were, ask me to clarify one specific thing."
+                f"Files already modified: {files_str}\n\n"
+                "INSTRUCTIONS: You were interrupted mid-task (reason: "
+                f"{interrupted_by}). The work above is ALREADY DONE. "
+                "Pick up exactly where you left off. "
+                "Do NOT re-read files you already processed. "
+                "Do NOT restart from the beginning. "
+                "Continue with the NEXT step after the last completed step. "
+                "If you are unsure what the next step is, say so in one sentence "
+                "and ask — do not restart the whole task."
             ),
         },
         "timestamp": datetime.utcnow().isoformat() + "Z",
@@ -223,7 +311,11 @@ def run_with_recovery(
 
     while True:
         attempt += 1
-        emit(f"\n[ai-runtime] attempt {attempt} | session {session.session_id}")
+        if attempt > MAX_ATTEMPTS:
+            emit(f"[ai-runtime] max attempts ({MAX_ATTEMPTS}) reached. stopping.")
+            emit(f"[ai-runtime] resume manually: ai-runtime resume {session.session_id}")
+            return 1
+        emit(f"\n[ai-runtime] attempt {attempt}/{MAX_ATTEMPTS} | session {session.session_id}")
 
         proc = subprocess.Popen(
             args,
@@ -282,13 +374,16 @@ def run_with_recovery(
 
         # Wait before resuming
         if interrupted_by == "rate_limit":
-            wait = DEFAULT_WAIT_SECONDS
-            emit(f"[ai-runtime] waiting {wait//60}m for rate limit reset...")
+            wait, wait_reason = compute_wait(output_lines)
+            emit(f"[ai-runtime] waiting until reset — {wait_reason}")
             deadline = time.time() + wait
             while time.time() < deadline:
                 remaining = int(deadline - time.time())
                 if not log_file:
-                    print(f"[ai-runtime] resuming in {remaining//60}m {remaining%60}s...", end="\r", flush=True)
+                    print(
+                        f"[ai-runtime] resuming in {remaining//60}m {remaining%60}s...",
+                        end="\r", flush=True,
+                    )
                 time.sleep(15)
             if not log_file:
                 print()
@@ -321,23 +416,34 @@ def cmd_run(task: str, extra_args: list[str], detach: bool = False):
     initial_args = ["claude", "--print", instrumented_task] + extra_args
 
     if detach:
-        # Fork and run in background, tail output
         log_path = session.log_file
         print(f"[ai-runtime] detached mode — output: {log_path}")
         print(f"[ai-runtime] attach with: ai-runtime attach {session_id}")
 
-        pid = os.fork()
-        if pid == 0:
-            # Child: detach from terminal, run recovery loop
-            os.setsid()
-            with open(log_path, "w") as lf:
-                sys.exit(run_with_recovery(initial_args, task, session, log_file=lf))
+        if IS_WINDOWS:
+            # Windows: spawn new detached process
+            import subprocess as _sp
+            CREATE_NEW_PROCESS_GROUP = 0x00000200
+            DETACHED_PROCESS = 0x00000008
+            proc = _sp.Popen(
+                [sys.executable, __file__, "_daemon", session_id, task, log_path] + extra_args,
+                creationflags=CREATE_NEW_PROCESS_GROUP | DETACHED_PROCESS,
+                close_fds=True,
+            )
+            session.write_pid(proc.pid)
+            print(f"[ai-runtime] daemon pid: {proc.pid}")
         else:
-            session.write_pid(pid)
-            print(f"[ai-runtime] daemon pid: {pid}")
-            # Tail log in foreground so user sees output
-            time.sleep(0.5)
-            _tail_log(log_path, follow=True, session=session)
+            pid = os.fork()
+            if pid == 0:
+                os.setsid()
+                with open(log_path, "w") as lf:
+                    sys.exit(run_with_recovery(initial_args, task, session, log_file=lf))
+            else:
+                session.write_pid(pid)
+                print(f"[ai-runtime] daemon pid: {pid}")
+
+        time.sleep(0.5)
+        _tail_log(log_path, follow=True, session=session)
 
     else:
         return run_with_recovery(initial_args, task, session)
@@ -559,6 +665,24 @@ def main():
 
     elif cmd == "recover":
         return cmd_recover() or 0
+
+    elif cmd == "_daemon":
+        # Internal: Windows detached process entry point
+        # args: _daemon <session_id> <task> <log_path> [extra...]
+        if len(rest) < 3:
+            return 1
+        _sid, _task, _log = rest[0], rest[1], rest[2]
+        _extra = rest[3:]
+        _session = Session(_sid, _task)
+        _instrumented = (
+            f"{_task}\n\n---\n"
+            "Note: After each significant step, emit a marker on its own line:\n"
+            "<!-- CHECKPOINT: brief description of what you just completed -->\n"
+            "This lets ai-runtime resume you accurately if interrupted."
+        )
+        _args = ["claude", "--print", _instrumented] + _extra
+        with open(_log, "w") as lf:
+            return run_with_recovery(_args, _task, _session, log_file=lf)
 
     else:
         print(f"unknown command: {cmd}")
